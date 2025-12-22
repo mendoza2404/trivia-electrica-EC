@@ -4,28 +4,25 @@ import os
 import time
 import random
 import string
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from typing import Dict, List, Optional
 
-# =========================
-# Files (local persistence)
-# =========================
 ROOMS_FILE = "rooms.json"
 STATS_FILE = "stats.json"
-QUESTIONS_JSON = "questions.json"  # optional external DB (recommended when you grow to 1000+)
+QUESTIONS_JSON = "questions.json"  # opcional: si existe, se usa como base grande
 
 # =========================
-# Models
+# Model
 # =========================
 @dataclass
 class Question:
     category: str
     prompt: str
-    options: Dict[str, str]  # keys A/B/C/D
+    options: Dict[str, str]  # A/B/C/D
     answer: str              # "A"/"B"/"C"/"D"
 
 # =========================
-# Helpers
+# Persistence
 # =========================
 def _load_json(path: str, default):
     if not os.path.exists(path):
@@ -42,6 +39,9 @@ def _save_json(path: str, data):
         json.dump(data, f, ensure_ascii=False, indent=2)
     os.replace(tmp, path)
 
+# =========================
+# Rooms
+# =========================
 def new_room_code(n=6):
     return "".join(random.choice(string.ascii_uppercase + string.digits) for _ in range(n))
 
@@ -51,8 +51,8 @@ def ensure_room(room_code: str):
         rooms[room_code] = {
             "created_at": int(time.time()),
             "seed": random.randint(1, 10**9),
-            "players": {},  # name -> {"answers": {idx: "A"}, "done": bool}
-            "result_saved": False,  # to prevent double-count
+            "players": {},        # name -> {"answers": {idx: "A"}, "done": bool}
+            "result_saved": False # para no duplicar ranking
         }
         _save_json(ROOMS_FILE, rooms)
 
@@ -65,6 +65,9 @@ def upsert_room(room_code: str, room_data: dict):
     rooms[room_code] = room_data
     _save_json(ROOMS_FILE, rooms)
 
+# =========================
+# Stats
+# =========================
 def update_stats(winner: str, loser: str, tie: bool = False):
     stats = _load_json(STATS_FILE, {})
     for name in {winner, loser}:
@@ -90,17 +93,54 @@ def leaderboard_rows():
     rows = []
     for name, s in stats.items():
         rows.append((name, s["wins"], s["losses"], s["ties"], s["games"]))
-    rows.sort(key=lambda x: (x[1], -x[2], x[4]), reverse=True)  # wins desc, losses asc-ish, games desc
+    rows.sort(key=lambda x: (x[1], -x[2], x[4]), reverse=True)
     return rows
 
-def safe_pick_balanced(bank: List[Question], seed: int, n_total: int = 10):
+# =========================
+# Questions
+# =========================
+def normalize_question_dict(q: dict) -> Optional[Question]:
+    try:
+        category = str(q["category"]).strip()
+        prompt = str(q["prompt"]).strip()
+        options = q["options"]
+        answer = str(q["answer"]).strip().upper()
+        if not isinstance(options, dict):
+            return None
+        for k in ["A", "B", "C", "D"]:
+            if k not in options:
+                return None
+        if answer not in ["A", "B", "C", "D"]:
+            return None
+        return Question(
+            category=category,
+            prompt=prompt,
+            options={k: str(options[k]) for k in ["A", "B", "C", "D"]},
+            answer=answer
+        )
+    except Exception:
+        return None
+
+def load_question_bank() -> List[Question]:
+    external = _load_json(QUESTIONS_JSON, None)
+    bank: List[Question] = []
+    if isinstance(external, list) and external:
+        for item in external:
+            if isinstance(item, dict):
+                q = normalize_question_dict(item)
+                if q:
+                    bank.append(q)
+        if len(bank) >= 50:
+            return bank
+    return EMBEDDED_BANK.copy()
+
+def safe_pick_balanced(bank: List[Question], seed: int, n_total: int = 10) -> List[Question]:
     """
-    Balanced pick target:
-      - 4 eléctrica
-      - 3 electrónica
-      - 3 general
-    If not enough questions in a category, fill from remaining pool.
-    Deterministic by seed.
+    Balance típico para mezcla:
+      4 Eléctrica
+      3 Electrónica
+      3 General
+    Determinístico por seed de la sala.
     """
     rng = random.Random(seed)
     by_cat = {"Eléctrica": [], "Electrónica": [], "General": []}
@@ -116,85 +156,39 @@ def safe_pick_balanced(bank: List[Question], seed: int, n_total: int = 10):
     rng.shuffle(others)
 
     want = {"Eléctrica": 4, "Electrónica": 3, "General": 3}
-    picked = []
-
-    # pick per category
+    picked: List[Question] = []
     for cat, cnt in want.items():
         picked.extend(by_cat[cat][:cnt])
 
-    # fill remainder if needed
     if len(picked) < n_total:
         remaining = []
-        # leftovers from the same cats
-        for cat in want:
-            remaining.extend(by_cat[cat][want[cat]:])
+        for cat, cnt in want.items():
+            remaining.extend(by_cat[cat][cnt:])
         remaining.extend(others)
         rng.shuffle(remaining)
         picked.extend(remaining[: (n_total - len(picked))])
 
-    # final shuffle to mix categories
     rng.shuffle(picked)
     return picked[:n_total]
-
-def normalize_question_dict(q: dict) -> Optional[Question]:
-    try:
-        category = str(q["category"]).strip()
-        prompt = str(q["prompt"]).strip()
-        options = q["options"]
-        answer = str(q["answer"]).strip().upper()
-        # basic validation
-        if not isinstance(options, dict):
-            return None
-        # Force A/B/C/D
-        keys = ["A", "B", "C", "D"]
-        if any(k not in options for k in keys):
-            return None
-        if answer not in keys:
-            return None
-        return Question(category=category, prompt=prompt, options={k: str(options[k]) for k in keys}, answer=answer)
-    except Exception:
-        return None
-
-def load_question_bank() -> List[Question]:
-    """
-    If questions.json exists, load it (recommended for 1000+).
-    Otherwise, use the embedded bank below.
-    """
-    external = _load_json(QUESTIONS_JSON, None)
-    bank: List[Question] = []
-
-    if isinstance(external, list) and external:
-        for item in external:
-            if isinstance(item, dict):
-                q = normalize_question_dict(item)
-                if q:
-                    bank.append(q)
-        if len(bank) >= 50:
-            return bank  # good enough external DB
-
-    # fallback to embedded DB
-    return EMBEDDED_BANK.copy()
 
 def compute_score(questions: List[Question], answers: Dict[str, str]) -> int:
     score = 0
     for i, q in enumerate(questions):
-        a = (answers.get(str(i)) or "").upper().strip()
+        a = (answers.get(str(i)) or "").strip().upper()
         if a == q.answer:
             score += 1
     return score
 
 # =========================
-# Embedded question bank (mixto)
-# You can grow this, or better: create questions.json with 1000+ items.
+# Embedded bank (mixto)
+# Puedes ampliarlo; ideal: usar questions.json para 1000+
 # =========================
 EMBEDDED_BANK: List[Question] = []
 
 def add_q(cat, prompt, A, B, C, D, ans):
-    EMBEDDED_BANK.append(
-        Question(cat, prompt, {"A": A, "B": B, "C": C, "D": D}, ans)
-    )
+    EMBEDDED_BANK.append(Question(cat, prompt, {"A": A, "B": B, "C": C, "D": D}, ans))
 
-# --- Eléctrica (varias) ---
+# Eléctrica
 add_q("Eléctrica", "¿Unidad de la resistencia eléctrica?", "Ohm (Ω)", "Volt (V)", "Ampere (A)", "Watt (W)", "A")
 add_q("Eléctrica", "En AC senoidal, potencia activa:", "P=V·I", "P=V·I·cosφ", "P=I²·X", "P=V²·R", "B")
 add_q("Eléctrica", "¿Qué protege un interruptor termomagnético?", "Sobretensión", "Fuga a tierra", "Sobrecarga y cortocircuito", "Armónicos", "C")
@@ -202,71 +196,41 @@ add_q("Eléctrica", "En paralelo, ¿qué es igual en todas las ramas?", "Corrien
 add_q("Eléctrica", "¿Instrumento para medir corriente?", "Voltímetro", "Amperímetro", "Ohmímetro", "Wattímetro", "B")
 add_q("Eléctrica", "¿Qué mide Hz?", "Frecuencia", "Energía", "Resistencia", "Potencia", "A")
 add_q("Eléctrica", "Potencia trifásica (balanceada) usando magnitudes de línea:", "P=V_L·I_L", "P=3·V_F·I_F", "P=√3·V_L·I_L·cosφ", "P=√3·V_F·I_F", "C")
-add_q("Eléctrica", "¿Qué significa FP (factor de potencia) en AC senoidal?", "P/S", "Q/S", "P/Q", "V/I", "A")
-add_q("Eléctrica", "¿Qué dispositivo se usa para elevar o bajar tensión en AC?", "Rectificador", "Transformador", "Variador VFD", "Batería", "B")
-add_q("Eléctrica", "¿Qué protege un interruptor diferencial (RCD)?", "Sobrecarga", "Cortocircuito", "Fuga a tierra", "Sobretensión", "C")
+add_q("Eléctrica", "¿Qué protege un diferencial (RCD)?", "Sobrecarga", "Cortocircuito", "Fuga a tierra", "Sobretensión", "C")
 add_q("Eléctrica", "En serie, la corriente:", "Se divide", "Es igual en todos los elementos", "Es cero", "Depende solo del voltaje", "B")
-add_q("Eléctrica", "¿Qué unidad corresponde a energía eléctrica?", "W", "Wh o kWh", "V", "A", "B")
-add_q("Eléctrica", "En un motor, ¿qué equipo típicamente protege por sobrecarga prolongada?", "Relé térmico", "SPD", "Transformador", "Rectificador", "A")
-add_q("Eléctrica", "¿Qué es un SPD?", "Protección contra sobretensiones transitorias", "Interruptor diferencial", "Protección contra sobrecarga", "Transformador de corriente", "A")
-add_q("Eléctrica", "En una instalación, el conductor PE se asocia a:", "Fase", "Neutro", "Tierra de protección", "Control", "C")
-add_q("Eléctrica", "¿Qué relación es correcta?", "1 kW = 100 W", "1 kW = 1000 W", "1 kW = 10,000 W", "1 kW = 1 W", "B")
-add_q("Eléctrica", "La caída de tensión en un conductor aumenta si:", "Baja la corriente", "Aumenta la resistencia o la corriente", "Disminuye la longitud", "Aumenta la sección", "B")
-add_q("Eléctrica", "¿Cuál es la función principal del neutro?", "Conducir potencia reactiva", "Referencia y retorno en sistemas monofásicos", "Protección contra rayos", "Aumentar el FP", "B")
-add_q("Eléctrica", "¿Qué es una puesta a tierra?", "Aislar un circuito", "Conectar a tierra para seguridad/estabilidad", "Elevar tensión", "Convertir AC a DC", "B")
-add_q("Eléctrica", "¿Qué significa 'cortocircuito'?", "Demasiada resistencia", "Camino de muy baja impedancia", "Voltaje nulo siempre", "Falta de neutro", "B")
+add_q("Eléctrica", "1 kW equivale a:", "100 W", "1000 W", "10,000 W", "1 W", "B")
 
-# --- Electrónica ---
+# Electrónica
 add_q("Electrónica", "¿Qué componente almacena energía en un campo eléctrico?", "Inductor", "Resistencia", "Capacitor", "Diodo", "C")
-add_q("Electrónica", "Un diodo ideal conduce:", "En ambos sentidos", "Solo en un sentido", "Solo AC", "Solo señales digitales", "B")
+add_q("Electrónica", "Un diodo ideal conduce:", "En ambos sentidos", "Solo en un sentido", "Solo AC", "Solo digital", "B")
 add_q("Electrónica", "¿Qué dispositivo amplifica señales típicamente?", "Fusible", "Transistor", "Capacitor", "Bobina", "B")
-add_q("Electrónica", "¿Qué hace un regulador de voltaje?", "Mantiene voltaje estable", "Aumenta la frecuencia", "Duplica potencia", "Elimina todo ruido", "A")
+add_q("Electrónica", "¿Qué hace un rectificador?", "Convierte AC a DC", "Convierte DC a AC", "Eleva tensión", "Aísla", "A")
 add_q("Electrónica", "GND normalmente es:", "Fase", "Neutro", "Referencia/tierra del circuito", "Protección SPD", "C")
-add_q("Electrónica", "¿Qué mide un multímetro en modo continuidad?", "Frecuencia", "Si hay camino eléctrico (baja R)", "Potencia activa", "Factor de potencia", "B")
-add_q("Electrónica", "¿Qué hace un rectificador?", "Convierte AC a DC", "Convierte DC a AC", "Eleva tensión AC", "Aísla señal", "A")
-add_q("Electrónica", "Un capacitor en DC ideal en estado estable se comporta como:", "Corto", "Abierto", "Resistencia fija", "Fuente", "B")
-add_q("Electrónica", "Una bobina (inductor) en DC ideal en estado estable se comporta como:", "Abierto", "Corto", "Diodo", "Transformador", "B")
+add_q("Electrónica", "Un capacitor ideal en DC (estado estable) se comporta como:", "Corto", "Abierto", "Resistencia", "Fuente", "B")
+add_q("Electrónica", "Una bobina ideal en DC (estado estable) se comporta como:", "Abierto", "Corto", "Diodo", "Transformador", "B")
+add_q("Electrónica", "PWM significa:", "Modulación de ancho de pulso", "Medición de potencia media", "Protección sobrecorriente", "Transformación de voltaje", "A")
+add_q("Electrónica", "ADC convierte:", "Analógico a digital", "Digital a analógico", "AC a DC", "DC a AC", "A")
 add_q("Electrónica", "LED significa:", "Light Emitting Diode", "Low Energy Device", "Linear Electronic Driver", "Logic Enabled Diode", "A")
-add_q("Electrónica", "¿Qué hace un filtro pasa-bajos?", "Deja pasar altas", "Deja pasar bajas y atenúa altas", "Convierte AC a DC", "Amplifica", "B")
-add_q("Electrónica", "¿Qué es PWM?", "Control por modulación de ancho de pulso", "Medición de potencia media", "Protección por sobrecorriente", "Transformación de voltaje", "A")
-add_q("Electrónica", "Un ADC convierte:", "Analógico a digital", "Digital a analógico", "AC a DC", "DC a AC", "A")
-add_q("Electrónica", "Un DAC convierte:", "Analógico a digital", "Digital a analógico", "AC a DC", "DC a AC", "B")
-add_q("Electrónica", "¿Qué es un osciloscopio?", "Medidor de potencia", "Visualiza señales en el tiempo", "Protector de sobretensión", "Medidor de aislamiento", "B")
-add_q("Electrónica", "¿Qué significa 'pull-up' en digital?", "Resistencia a Vcc para definir '1' por defecto", "Bajar voltaje", "Filtro de ruido", "Rectificador", "A")
-add_q("Electrónica", "¿Qué hace un amplificador operacional (op-amp) ideal en lazo cerrado?", "Satura siempre", "Amplifica según red de realimentación", "Rectifica", "Filtra solo", "B")
-add_q("Electrónica", "En lógica TTL/CMOS, un '1' lógico representa:", "Nivel bajo", "Nivel alto", "Corriente cero", "Frecuencia alta", "B")
-add_q("Electrónica", "¿Qué es un fusible electrónico (PTC resettable)?", "Protección que se 'resetea' al enfriar", "Transformador", "Rectificador", "Capacitor", "A")
 
-# --- General (cultura + ciencia/tech) ---
+# General
 add_q("General", "¿Cuántos bits tiene 1 byte?", "4", "8", "16", "32", "B")
 add_q("General", "¿Símbolo químico del cobre?", "Co", "Cu", "Cr", "Cb", "B")
 add_q("General", "¿Qué planeta tiene el campo magnético más fuerte del sistema solar?", "Marte", "Tierra", "Júpiter", "Venus", "C")
-add_q("General", "¿Quién fue clave en experimentos de electromagnetismo?", "Darwin", "Faraday", "Galileo", "Bohr", "B")
-add_q("General", "¿Qué unidad mide la presión?", "Pascal (Pa)", "Newton (N)", "Joule (J)", "Watt (W)", "A")
-add_q("General", "¿Qué significa CPU?", "Central Processing Unit", "Control Power Unit", "Core Program Utility", "Circuit Protection Unit", "A")
-add_q("General", "¿Qué es “IoT”?", "Internet of Things", "Input of Time", "Interface of Tools", "Internal of Tech", "A")
-add_q("General", "¿Cuál es el océano más grande?", "Atlántico", "Índico", "Pacífico", "Ártico", "C")
-add_q("General", "¿Qué mide un termómetro?", "Presión", "Temperatura", "Humedad", "Velocidad", "B")
-add_q("General", "¿Qué significa GPS?", "Global Positioning System", "General Power Supply", "Graphical Position Sensor", "Ground Pressure System", "A")
-add_q("General", "¿Qué gas respiramos en mayor proporción?", "Oxígeno", "Nitrógeno", "CO2", "Helio", "B")
+add_q("General", "¿Quién fue clave en electromagnetismo experimental?", "Darwin", "Faraday", "Galileo", "Bohr", "B")
 add_q("General", "¿Cuál es la capital de Ecuador?", "Guayaquil", "Quito", "Cuenca", "Manta", "B")
-add_q("General", "¿Qué mide un luxómetro?", "Flujo luminoso", "Iluminancia", "Potencia", "Corriente", "B")
-add_q("General", "¿Qué significa URL?", "Uniform Resource Locator", "Universal Relay Logic", "User Request List", "Ultra Rapid Link", "A")
-add_q("General", "¿Qué es “open source”?", "Software de pago", "Código abierto", "Solo para empresas", "Solo offline", "B")
-add_q("General", "¿Cuál es la velocidad aproximada de la luz en el vacío?", "300,000 km/s", "30,000 km/s", "3,000 km/s", "3,000,000 km/s", "A")
-add_q("General", "¿Qué instrumento mide humedad relativa?", "Barómetro", "Higrómetro", "Manómetro", "Anemómetro", "B")
-add_q("General", "¿Qué significa AI en inglés?", "Artificial Intelligence", "Automatic Input", "Analog Interface", "Applied Internet", "A")
-
-# (Puedes seguir agregando preguntas con add_q(...). Ideal: migrar a questions.json y crecer a 1000+.)
+add_q("General", "¿Qué significa CPU?", "Central Processing Unit", "Control Power Unit", "Core Program Utility", "Circuit Protection Unit", "A")
+add_q("General", "¿Qué significa GPS?", "Global Positioning System", "General Power Supply", "Graphical Position Sensor", "Ground Pressure System", "A")
+add_q("General", "¿Cuál es el océano más grande?", "Atlántico", "Índico", "Pacífico", "Ártico", "C")
+add_q("General", "¿Qué instrumento mide temperatura?", "Barómetro", "Termómetro", "Higrómetro", "Anemómetro", "B")
+add_q("General", "¿Qué es IoT?", "Internet of Things", "Input of Time", "Interface of Tools", "Internal of Tech", "A")
 
 # =========================
-# Streamlit UI
+# UI
 # =========================
 st.set_page_config(page_title="Trivia 2 jugadores ⚡", page_icon="⚡", layout="centered")
 st.title("⚡ Trivia a distancia (2 jugadores)")
-st.caption("Misma sala = mismas 10 preguntas. Respuestas ocultas hasta el final 😄")
+st.caption("Misma sala = mismas 10 preguntas. ✅ Respuestas ocultas hasta el final 😄")
 
-# Sidebar leaderboard
 with st.sidebar:
     st.subheader("🏆 Ranking burrit@ (histórico)")
     rows = leaderboard_rows()
@@ -329,15 +293,12 @@ with tab1:
 
     bank = load_question_bank()
     if len(bank) < 20:
-        st.error("El banco de preguntas es muy pequeño. Agrega más preguntas (ideal 200+ / 1000+).")
+        st.error("Banco de preguntas muy pequeño. Agrega más (ideal 200+ o usa questions.json).")
         st.stop()
 
-    # deterministic question pick per room
     questions = safe_pick_balanced(bank, seed=room["seed"], n_total=10)
 
-    # -------------------------
-    # Gameplay (answers hidden)
-    # -------------------------
+    # gameplay
     room = get_room(room_code) or room
     my = room["players"].get(player_name) or {"answers": {}, "done": False}
 
@@ -369,8 +330,6 @@ with tab1:
                 my = room["players"][player_name]
 
                 my["answers"][str(idx)] = chosen_key
-
-                # mark done when 10 answered
                 if len(my["answers"]) >= 10:
                     my["done"] = True
 
@@ -378,11 +337,10 @@ with tab1:
                 upsert_room(room_code, room)
                 st.rerun()
 
+            # 👇 IMPORTANTÍSIMO: NO mostramos la respuesta correcta aquí
             st.divider()
 
-    # -------------------------
-    # Room status + Final
-    # -------------------------
+    # status
     room = get_room(room_code) or room
     players = room.get("players", {})
 
@@ -390,15 +348,14 @@ with tab1:
     if players:
         for pname, pdata in players.items():
             status = "✅ listo" if pdata.get("done") else "⌛ jugando"
-            # compute score only for display (still hidden answers during play; score can be shown)
             score = compute_score(questions, pdata.get("answers", {}))
             st.write(f"- **{pname}** — {status} — Puntaje: **{score}/10**")
     else:
         st.write("Aún no hay jugadores.")
 
+    # final (only when 2 done)
     done_players = [(pname, pdata) for pname, pdata in players.items() if pdata.get("done")]
     if len(done_players) >= 2:
-        # choose 2 first by join order (dict insertion order)
         p1, d1 = done_players[0]
         p2, d2 = done_players[1]
 
@@ -410,28 +367,23 @@ with tab1:
         st.write(f"**{p2}**: {s2}/10")
 
         if s1 > s2:
-            winner, loser = p1, p2
+            winner, loser, tie = p1, p2, False
             st.success(f"🏆 Ganador: **{winner}** — 💸 **{loser}** paga la apuesta 😄")
-            tie = False
         elif s2 > s1:
-            winner, loser = p2, p1
+            winner, loser, tie = p2, p1, False
             st.success(f"🏆 Ganador: **{winner}** — 💸 **{loser}** paga la apuesta 😄")
-            tie = False
         else:
-            winner, loser = p1, p2
+            winner, loser, tie = p1, p2, True
             st.info("🤝 Empate — ambos pagan o hacen desempate 😄")
-            tie = True
 
-        # Save result ONCE per room
+        # save result ONCE
         if not room.get("result_saved", False):
             update_stats(winner=winner, loser=loser, tie=tie)
             room["result_saved"] = True
             upsert_room(room_code, room)
             st.toast("✅ Ranking actualizado automáticamente", icon="🏆")
 
-        # =========================
-        # Review (answers revealed ONLY at the end)
-        # =========================
+        # ✅ REVELAR RESPUESTAS SOLO AQUÍ (AL FINAL)
         st.subheader("🧾 Revisión final (ahora sí se muestran respuestas)")
         for i, q in enumerate(questions):
             a1 = (d1.get("answers", {}).get(str(i)) or "-").upper()
@@ -440,13 +392,13 @@ with tab1:
 
             st.markdown(f"**{i+1}. {q.prompt}**  \n_Categoría: {q.category}_")
             st.write(f"✅ Correcta: **{correct}) {q.options[correct]}**")
-            st.write(f"👤 {p1}: **{a1}**" + (f" ✅" if a1 == correct else " ❌"))
-            st.write(f"👤 {p2}: **{a2}**" + (f" ✅" if a2 == correct else " ❌"))
+            st.write(f"👤 {p1}: **{a1}**" + (" ✅" if a1 == correct else " ❌"))
+            st.write(f"👤 {p2}: **{a2}**" + (" ✅" if a2 == correct else " ❌"))
             st.divider()
 
 with tab2:
     st.subheader("📌 Cómo mandarle la invitación por WhatsApp")
-    st.write("1) Comparte el link de esta app.\n2) Crea una sala y envía el Room Code.\n3) Ambos entran con el mismo Room Code.")
+    st.write("1) Comparte el link.\n2) Crea sala y envía el Room Code.\n3) Ambos entran con el mismo Room Code.")
     st.code(
         "Amor ❤️, entremos a la trivia ⚡\n"
         "Link: (pega aquí el link)\n"
@@ -455,16 +407,13 @@ with tab2:
         language="text"
     )
 
-    st.subheader("📚 Banco de preguntas grande (1000+)")
-    st.write(
-        "Este app **soporta** un archivo `questions.json` (recomendado) para crecer a 1000+ preguntas sin tocar el código.\n"
-        "Formato: lista de objetos con `category`, `prompt`, `options` (A/B/C/D) y `answer`."
-    )
+    st.subheader("📚 Base grande (1000+)")
+    st.write("Si subes un archivo `questions.json` al repo, la app lo usará automáticamente.")
     st.code(
         """[
   {
     "category": "Eléctrica",
-    "prompt": "¿Qué protege un interruptor diferencial (RCD)?",
+    "prompt": "¿Qué protege un diferencial (RCD)?",
     "options": {"A":"Sobrecarga","B":"Cortocircuito","C":"Fuga a tierra","D":"Sobretensión"},
     "answer": "C"
   }
