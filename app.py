@@ -4,26 +4,27 @@ import os
 import time
 import random
 import string
+import re
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 ROOMS_FILE = "rooms.json"
 STATS_FILE = "stats.json"
-QUESTIONS_JSON = "questions.json"  # opcional: si existe, se usa como base grande
+QUESTIONS_JSON = "questions.json"  # contiene el banco grande
 
-# =========================
+# -------------------------
 # Model
-# =========================
+# -------------------------
 @dataclass
 class Question:
     category: str
     prompt: str
-    options: Dict[str, str]  # A/B/C/D
-    answer: str              # "A"/"B"/"C"/"D"
+    options: Dict[str, str]
+    answer: str
 
-# =========================
-# Persistence
-# =========================
+# -------------------------
+# Persistence helpers
+# -------------------------
 def _load_json(path: str, default):
     if not os.path.exists(path):
         return default
@@ -39,9 +40,9 @@ def _save_json(path: str, data):
         json.dump(data, f, ensure_ascii=False, indent=2)
     os.replace(tmp, path)
 
-# =========================
+# -------------------------
 # Rooms
-# =========================
+# -------------------------
 def new_room_code(n=6):
     return "".join(random.choice(string.ascii_uppercase + string.digits) for _ in range(n))
 
@@ -51,8 +52,11 @@ def ensure_room(room_code: str):
         rooms[room_code] = {
             "created_at": int(time.time()),
             "seed": random.randint(1, 10**9),
-            "players": {},        # name -> {"answers": {idx: "A"}, "done": bool}
-            "result_saved": False # para no duplicar ranking
+            "players": {},          # name -> {"answers": {idx:"A"}, "done": bool}
+            "locked": False,        # true cuando alguien termina primero
+            "winner": None,         # nombre de quien terminó primero
+            "ended_at": None,       # timestamp
+            "result_saved": False,  # para ranking (una sola vez)
         }
         _save_json(ROOMS_FILE, rooms)
 
@@ -65,9 +69,9 @@ def upsert_room(room_code: str, room_data: dict):
     rooms[room_code] = room_data
     _save_json(ROOMS_FILE, rooms)
 
-# =========================
+# -------------------------
 # Stats
-# =========================
+# -------------------------
 def update_stats(winner: str, loser: str, tie: bool = False):
     stats = _load_json(STATS_FILE, {})
     for name in {winner, loser}:
@@ -96,9 +100,9 @@ def leaderboard_rows():
     rows.sort(key=lambda x: (x[1], -x[2], x[4]), reverse=True)
     return rows
 
-# =========================
+# -------------------------
 # Questions
-# =========================
+# -------------------------
 def normalize_question_dict(q: dict) -> Optional[Question]:
     try:
         category = str(q["category"]).strip()
@@ -122,54 +126,23 @@ def normalize_question_dict(q: dict) -> Optional[Question]:
         return None
 
 def load_question_bank() -> List[Question]:
-    external = _load_json(QUESTIONS_JSON, None)
-    bank: List[Question] = []
-    if isinstance(external, list) and external:
-        for item in external:
+    raw = _load_json(QUESTIONS_JSON, [])
+    bank = []
+    if isinstance(raw, list):
+        for item in raw:
             if isinstance(item, dict):
                 q = normalize_question_dict(item)
                 if q:
                     bank.append(q)
-        if len(bank) >= 50:
-            return bank
-    return EMBEDDED_BANK.copy()
+    return bank
 
-def safe_pick_balanced(bank: List[Question], seed: int, n_total: int = 10) -> List[Question]:
-    """
-    Balance típico para mezcla:
-      4 Eléctrica
-      3 Electrónica
-      3 General
-    Determinístico por seed de la sala.
-    """
+def pick_questions_for_room(bank: List[Question], seed: int, n_total: int = 10) -> List[Question]:
+    # determinístico por sala, sin repetición
     rng = random.Random(seed)
-    by_cat = {"Eléctrica": [], "Electrónica": [], "General": []}
-    others = []
-    for q in bank:
-        if q.category in by_cat:
-            by_cat[q.category].append(q)
-        else:
-            others.append(q)
-
-    for k in by_cat:
-        rng.shuffle(by_cat[k])
-    rng.shuffle(others)
-
-    want = {"Eléctrica": 4, "Electrónica": 3, "General": 3}
-    picked: List[Question] = []
-    for cat, cnt in want.items():
-        picked.extend(by_cat[cat][:cnt])
-
-    if len(picked) < n_total:
-        remaining = []
-        for cat, cnt in want.items():
-            remaining.extend(by_cat[cat][cnt:])
-        remaining.extend(others)
-        rng.shuffle(remaining)
-        picked.extend(remaining[: (n_total - len(picked))])
-
-    rng.shuffle(picked)
-    return picked[:n_total]
+    if len(bank) < n_total:
+        return bank[:]
+    idxs = rng.sample(range(len(bank)), n_total)
+    return [bank[i] for i in idxs]
 
 def compute_score(questions: List[Question], answers: Dict[str, str]) -> int:
     score = 0
@@ -179,57 +152,82 @@ def compute_score(questions: List[Question], answers: Dict[str, str]) -> int:
             score += 1
     return score
 
-# =========================
-# Embedded bank (mixto)
-# Puedes ampliarlo; ideal: usar questions.json para 1000+
-# =========================
-EMBEDDED_BANK: List[Question] = []
+# -------------------------
+# Fun: gender-ish teasing (heuristic + neutral fallback)
+# -------------------------
+def gender_guess(name: str) -> str:
+    """
+    Heurística simple:
+    - termina en 'a' -> fem
+    - termina en 'o' -> masc
+    - nombres comunes -> m/f
+    - fallback -> neutral
+    """
+    n = (name or "").strip().lower()
+    first = re.split(r"\s+", n)[0] if n else ""
+    female_names = {"elizabeth","andrea","maria","carla","paola","diana","laura","sofia","camila","ana","gabriela","valentina","lucia","isabel"}
+    male_names = {"carlos","alberto","juan","jose","pedro","miguel","diego","javier","marco","luis","andres","ricardo","fernando","manuel"}
+    if first in female_names:
+        return "f"
+    if first in male_names:
+        return "m"
+    if first.endswith("a"):
+        return "f"
+    if first.endswith("o"):
+        return "m"
+    return "n"
 
-def add_q(cat, prompt, A, B, C, D, ans):
-    EMBEDDED_BANK.append(Question(cat, prompt, {"A": A, "B": B, "C": C, "D": D}, ans))
+def taunt(winner: str, loser: str) -> str:
+    g = gender_guess(loser)
+    # Evitar insultos fuertes: solo picante/juguetón.
+    if g == "f":
+        variants = [
+            f"🏆 {winner} ganó. {loser}, hoy te tocó modo *novata* 😄",
+            f"⚡ Victoria de {winner}. {loser}, la próxima vienes con más voltaje 😉",
+            f"😂 {winner} se lleva la corona. {loser}, hoy la electrónica te hizo ghosting."
+        ]
+    elif g == "m":
+        variants = [
+            f"🏆 {winner} ganó. {loser}, hoy quedaste como *burrito* oficial 😄",
+            f"⚡ Victoria de {winner}. {loser}, te faltó amperaje para aguantar el ritmo 😉",
+            f"😂 {winner} se la llevó. {loser}, hoy te dispararon las protecciones."
+        ]
+    else:
+        variants = [
+            f"🏆 {winner} ganó. {loser}, hoy tocó modo *burrit@* 😄",
+            f"⚡ Victoria de {winner}. {loser}, la próxima con más potencia 😉",
+            f"😂 {winner} se la llevó. {loser}, hoy te faltó chispa."
+        ]
+    return random.choice(variants)
 
-# Eléctrica
-add_q("Eléctrica", "¿Unidad de la resistencia eléctrica?", "Ohm (Ω)", "Volt (V)", "Ampere (A)", "Watt (W)", "A")
-add_q("Eléctrica", "En AC senoidal, potencia activa:", "P=V·I", "P=V·I·cosφ", "P=I²·X", "P=V²·R", "B")
-add_q("Eléctrica", "¿Qué protege un interruptor termomagnético?", "Sobretensión", "Fuga a tierra", "Sobrecarga y cortocircuito", "Armónicos", "C")
-add_q("Eléctrica", "En paralelo, ¿qué es igual en todas las ramas?", "Corriente", "Voltaje", "Resistencia", "Potencia", "B")
-add_q("Eléctrica", "¿Instrumento para medir corriente?", "Voltímetro", "Amperímetro", "Ohmímetro", "Wattímetro", "B")
-add_q("Eléctrica", "¿Qué mide Hz?", "Frecuencia", "Energía", "Resistencia", "Potencia", "A")
-add_q("Eléctrica", "Potencia trifásica (balanceada) usando magnitudes de línea:", "P=V_L·I_L", "P=3·V_F·I_F", "P=√3·V_L·I_L·cosφ", "P=√3·V_F·I_F", "C")
-add_q("Eléctrica", "¿Qué protege un diferencial (RCD)?", "Sobrecarga", "Cortocircuito", "Fuga a tierra", "Sobretensión", "C")
-add_q("Eléctrica", "En serie, la corriente:", "Se divide", "Es igual en todos los elementos", "Es cero", "Depende solo del voltaje", "B")
-add_q("Eléctrica", "1 kW equivale a:", "100 W", "1000 W", "10,000 W", "1 W", "B")
-
-# Electrónica
-add_q("Electrónica", "¿Qué componente almacena energía en un campo eléctrico?", "Inductor", "Resistencia", "Capacitor", "Diodo", "C")
-add_q("Electrónica", "Un diodo ideal conduce:", "En ambos sentidos", "Solo en un sentido", "Solo AC", "Solo digital", "B")
-add_q("Electrónica", "¿Qué dispositivo amplifica señales típicamente?", "Fusible", "Transistor", "Capacitor", "Bobina", "B")
-add_q("Electrónica", "¿Qué hace un rectificador?", "Convierte AC a DC", "Convierte DC a AC", "Eleva tensión", "Aísla", "A")
-add_q("Electrónica", "GND normalmente es:", "Fase", "Neutro", "Referencia/tierra del circuito", "Protección SPD", "C")
-add_q("Electrónica", "Un capacitor ideal en DC (estado estable) se comporta como:", "Corto", "Abierto", "Resistencia", "Fuente", "B")
-add_q("Electrónica", "Una bobina ideal en DC (estado estable) se comporta como:", "Abierto", "Corto", "Diodo", "Transformador", "B")
-add_q("Electrónica", "PWM significa:", "Modulación de ancho de pulso", "Medición de potencia media", "Protección sobrecorriente", "Transformación de voltaje", "A")
-add_q("Electrónica", "ADC convierte:", "Analógico a digital", "Digital a analógico", "AC a DC", "DC a AC", "A")
-add_q("Electrónica", "LED significa:", "Light Emitting Diode", "Low Energy Device", "Linear Electronic Driver", "Logic Enabled Diode", "A")
-
-# General
-add_q("General", "¿Cuántos bits tiene 1 byte?", "4", "8", "16", "32", "B")
-add_q("General", "¿Símbolo químico del cobre?", "Co", "Cu", "Cr", "Cb", "B")
-add_q("General", "¿Qué planeta tiene el campo magnético más fuerte del sistema solar?", "Marte", "Tierra", "Júpiter", "Venus", "C")
-add_q("General", "¿Quién fue clave en electromagnetismo experimental?", "Darwin", "Faraday", "Galileo", "Bohr", "B")
-add_q("General", "¿Cuál es la capital de Ecuador?", "Guayaquil", "Quito", "Cuenca", "Manta", "B")
-add_q("General", "¿Qué significa CPU?", "Central Processing Unit", "Control Power Unit", "Core Program Utility", "Circuit Protection Unit", "A")
-add_q("General", "¿Qué significa GPS?", "Global Positioning System", "General Power Supply", "Graphical Position Sensor", "Ground Pressure System", "A")
-add_q("General", "¿Cuál es el océano más grande?", "Atlántico", "Índico", "Pacífico", "Ártico", "C")
-add_q("General", "¿Qué instrumento mide temperatura?", "Barómetro", "Termómetro", "Higrómetro", "Anemómetro", "B")
-add_q("General", "¿Qué es IoT?", "Internet of Things", "Input of Time", "Interface of Tools", "Internal of Tech", "A")
-
-# =========================
+# -------------------------
 # UI
-# =========================
-st.set_page_config(page_title="Trivia 2 jugadores ⚡", page_icon="⚡", layout="centered")
-st.title("⚡ Trivia a distancia (2 jugadores)")
-st.caption("Misma sala = mismas 10 preguntas. ✅ Respuestas ocultas hasta el final 😄")
+# -------------------------
+st.set_page_config(page_title="Trivia técnica (2 jugadores) ⚡", page_icon="⚡", layout="centered")
+
+# CSS for "answered" highlight
+st.markdown("""
+<style>
+.answer-box {
+  border: 1px solid rgba(0,0,0,0.1);
+  padding: 14px 14px 6px 14px;
+  border-radius: 14px;
+  margin-bottom: 12px;
+}
+.answered {
+  border: 2px solid #2e7d32 !important;
+  background: rgba(46,125,50,0.08);
+}
+.locked {
+  border: 2px solid #b71c1c !important;
+  background: rgba(183,28,28,0.06);
+}
+.smallnote { font-size: 0.9rem; opacity: 0.8; }
+</style>
+""", unsafe_allow_html=True)
+
+st.title("⚡ Trivia técnica a distancia (2 jugadores)")
+st.caption("Banco grande (600). 10 preguntas por partida. Respuestas ocultas hasta el final.")
 
 with st.sidebar:
     st.subheader("🏆 Ranking burrit@ (histórico)")
@@ -244,7 +242,7 @@ with st.sidebar:
 
 st.divider()
 
-tab1, tab2 = st.tabs(["🎮 Jugar", "📌 Instrucciones WhatsApp"])
+tab1, tab2 = st.tabs(["🎮 Jugar", "📌 WhatsApp"])
 
 with tab1:
     colA, colB = st.columns(2)
@@ -287,27 +285,39 @@ with tab1:
         st.warning("Escribe tu nombre para empezar.")
         st.stop()
 
+    # Load bank
+    bank = load_question_bank()
+    if len(bank) < 100:
+        st.error("No encuentro un banco grande. Asegúrate de tener `questions.json` en el repo.")
+        st.stop()
+
+    # Deterministic questions per room
+    questions = pick_questions_for_room(bank, seed=room["seed"], n_total=10)
+
     # init player
     room["players"].setdefault(player_name, {"answers": {}, "done": False})
     upsert_room(room_code, room)
 
-    bank = load_question_bank()
-    if len(bank) < 20:
-        st.error("Banco de preguntas muy pequeño. Agrega más (ideal 200+ o usa questions.json).")
-        st.stop()
-
-    questions = safe_pick_balanced(bank, seed=room["seed"], n_total=10)
-
-    # gameplay
+    # Reload
     room = get_room(room_code) or room
     my = room["players"].get(player_name) or {"answers": {}, "done": False}
 
-    if my.get("done"):
-        st.success("✅ Ya terminaste tus 10 preguntas. Esperando al otro jugador…")
+    # If room locked by someone else, prevent answering
+    locked = bool(room.get("locked", False))
+    winner = room.get("winner")
+
+    if locked and winner and winner != player_name:
+        st.warning(f"⛔ Juego terminado: **{winner}** terminó primero y cerró la partida. Ya no puedes responder más.")
+    elif my.get("done"):
+        st.success("✅ Terminaste tus 10 preguntas. (Si el otro no terminó antes, la partida queda cerrada al completarlas).")
     else:
-        st.info("🕵️ Modo competencia: **NO se muestran respuestas** hasta el final.")
+        st.info("🕵️ Modo competencia: **NO se muestran respuestas** hasta el final. Cada confirmación marca tu respuesta.")
 
         for idx, q in enumerate(questions):
+            answered = str(idx) in (my.get("answers") or {})
+            box_class = "answer-box answered" if answered else "answer-box"
+            st.markdown(f'<div class="{box_class}">', unsafe_allow_html=True)
+
             st.markdown(f"### Pregunta {idx+1}/10 — _{q.category}_")
             st.write(q.prompt)
 
@@ -320,103 +330,113 @@ with tab1:
                 labels,
                 index=default_index,
                 key=f"q_{idx}_{player_name}_{room_code}",
-                horizontal=False
+                horizontal=False,
+                disabled=locked
             )
             chosen_key = choice_label.split(")")[0].strip().upper()
 
-            if st.button("✅ Confirmar respuesta", key=f"confirm_{idx}_{player_name}_{room_code}"):
+            # confirm
+            btn_label = "✅ Confirmada" if answered else "✅ Confirmar respuesta"
+            if st.button(btn_label, key=f"confirm_{idx}_{player_name}_{room_code}", disabled=locked):
+                # reload state
                 room = get_room(room_code) or room
+                if room.get("locked", False):
+                    st.rerun()
+
                 room["players"].setdefault(player_name, {"answers": {}, "done": False})
                 my = room["players"][player_name]
-
                 my["answers"][str(idx)] = chosen_key
+
+                # if completed 10 -> lock room immediately
                 if len(my["answers"]) >= 10:
                     my["done"] = True
+                    room["locked"] = True
+                    room["winner"] = player_name
+                    room["ended_at"] = int(time.time())
 
                 room["players"][player_name] = my
                 upsert_room(room_code, room)
                 st.rerun()
 
-            # 👇 IMPORTANTÍSIMO: NO mostramos la respuesta correcta aquí
-            st.divider()
+            st.markdown('<div class="smallnote">Al confirmar, la tarjeta queda marcada en verde.</div>', unsafe_allow_html=True)
+            st.markdown("</div>", unsafe_allow_html=True)
 
-    # status
+    # Status section (always visible)
     room = get_room(room_code) or room
     players = room.get("players", {})
 
     st.subheader("📣 Estado de la sala")
-    if players:
-        for pname, pdata in players.items():
-            status = "✅ listo" if pdata.get("done") else "⌛ jugando"
-            score = compute_score(questions, pdata.get("answers", {}))
-            st.write(f"- **{pname}** — {status} — Puntaje: **{score}/10**")
-    else:
-        st.write("Aún no hay jugadores.")
+    for pname, pdata in players.items():
+        status = "✅ listo" if pdata.get("done") else "⌛ jugando"
+        score = compute_score(questions, pdata.get("answers", {}))
+        st.write(f"- **{pname}** — {status} — Puntaje: **{score}/10**")
 
-    # final (only when 2 done)
-    done_players = [(pname, pdata) for pname, pdata in players.items() if pdata.get("done")]
-    if len(done_players) >= 2:
-        p1, d1 = done_players[0]
-        p2, d2 = done_players[1]
+    # End-game logic: if locked OR at least one done triggers end
+    if room.get("locked", False) and room.get("winner"):
+        # Determine top two players: winner and whoever else joined (if any)
+        win = room["winner"]
+        others = [p for p in players.keys() if p != win]
+        opp = others[0] if others else None
 
-        s1 = compute_score(questions, d1.get("answers", {}))
-        s2 = compute_score(questions, d2.get("answers", {}))
+        win_answers = players.get(win, {}).get("answers", {})
+        win_score = compute_score(questions, win_answers)
+
+        if opp:
+            opp_answers = players.get(opp, {}).get("answers", {})
+            opp_score = compute_score(questions, opp_answers)
+        else:
+            opp_answers = {}
+            opp_score = 0
 
         st.subheader("🏁 Resultado final")
-        st.write(f"**{p1}**: {s1}/10")
-        st.write(f"**{p2}**: {s2}/10")
-
-        if s1 > s2:
-            winner, loser, tie = p1, p2, False
-            st.success(f"🏆 Ganador: **{winner}** — 💸 **{loser}** paga la apuesta 😄")
-        elif s2 > s1:
-            winner, loser, tie = p2, p1, False
-            st.success(f"🏆 Ganador: **{winner}** — 💸 **{loser}** paga la apuesta 😄")
+        st.write(f"**{win}**: {win_score}/10  ✅ (terminó primero)")
+        if opp:
+            st.write(f"**{opp}**: {opp_score}/10")
         else:
-            winner, loser, tie = p1, p2, True
-            st.info("🤝 Empate — ambos pagan o hacen desempate 😄")
+            st.write("⚠️ Aún no hay oponente en la sala (invita a alguien para que el duelo tenga sentido 😄).")
 
-        # save result ONCE
-        if not room.get("result_saved", False):
-            update_stats(winner=winner, loser=loser, tie=tie)
+        # Save ranking once (only if there is an opponent)
+        if opp and not room.get("result_saved", False):
+            if win_score > opp_score:
+                update_stats(winner=win, loser=opp, tie=False)
+                st.success(taunt(win, opp))
+            elif opp_score > win_score:
+                update_stats(winner=opp, loser=win, tie=False)
+                st.success(taunt(opp, win))
+            else:
+                update_stats(winner=win, loser=opp, tie=True)
+                st.info("🤝 Empate técnico: ambos pagan o van a desempate 😄")
+
             room["result_saved"] = True
             upsert_room(room_code, room)
             st.toast("✅ Ranking actualizado automáticamente", icon="🏆")
 
-        # ✅ REVELAR RESPUESTAS SOLO AQUÍ (AL FINAL)
-        st.subheader("🧾 Revisión final (ahora sí se muestran respuestas)")
-        for i, q in enumerate(questions):
-            a1 = (d1.get("answers", {}).get(str(i)) or "-").upper()
-            a2 = (d2.get("answers", {}).get(str(i)) or "-").upper()
-            correct = q.answer
+        # Corrections / review: show correct + both answers + correctness
+        if opp:
+            st.subheader("🧾 Correcciones (respuestas reveladas al finalizar)")
+            for i, q in enumerate(questions):
+                correct = q.answer
+                a_w = (win_answers.get(str(i)) or "-").upper()
+                a_o = (opp_answers.get(str(i)) or "-").upper()
 
-            st.markdown(f"**{i+1}. {q.prompt}**  \n_Categoría: {q.category}_")
-            st.write(f"✅ Correcta: **{correct}) {q.options[correct]}**")
-            st.write(f"👤 {p1}: **{a1}**" + (" ✅" if a1 == correct else " ❌"))
-            st.write(f"👤 {p2}: **{a2}**" + (" ✅" if a2 == correct else " ❌"))
-            st.divider()
+                def mark(ans):
+                    if ans == "-":
+                        return "⏹️ sin responder"
+                    return "✅ correcto" if ans == correct else "❌ incorrecto"
+
+                st.markdown(f"**{i+1}. {q.prompt}**  \n_Categoría: {q.category}_")
+                st.write(f"✅ Correcta: **{correct}) {q.options[correct]}**")
+                st.write(f"👤 {win}: **{a_w}** — {mark(a_w)}")
+                st.write(f"👤 {opp}: **{a_o}** — {mark(a_o)}")
+                st.divider()
 
 with tab2:
-    st.subheader("📌 Cómo mandarle la invitación por WhatsApp")
-    st.write("1) Comparte el link.\n2) Crea sala y envía el Room Code.\n3) Ambos entran con el mismo Room Code.")
+    st.subheader("📌 Mensaje WhatsApp (cópialo)")
     st.code(
-        "Amor ❤️, entremos a la trivia ⚡\n"
-        "Link: (pega aquí el link)\n"
-        "Room Code: ABC123\n"
-        "Regla: 10 preguntas, el que pierde paga 😄",
+        "Amor ❤️😄 te reto a la trivia ⚡\n"
+        "Link: (pega aquí el link de Streamlit)\n"
+        "Room Code: (te lo paso)\n"
+        "Regla: 10 preguntas. El que pierde paga ☕🍕\n",
         language="text"
     )
-
-    st.subheader("📚 Base grande (1000+)")
-    st.write("Si subes un archivo `questions.json` al repo, la app lo usará automáticamente.")
-    st.code(
-        """[
-  {
-    "category": "Eléctrica",
-    "prompt": "¿Qué protege un diferencial (RCD)?",
-    "options": {"A":"Sobrecarga","B":"Cortocircuito","C":"Fuga a tierra","D":"Sobretensión"},
-    "answer": "C"
-  }
-]""",
-        language="json"
-    )
+    st.write("💡 Nota: el juego se cierra cuando alguien termina primero las 10 preguntas.")
